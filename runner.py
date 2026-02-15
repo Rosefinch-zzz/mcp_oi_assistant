@@ -1,7 +1,6 @@
 """代码运行模块：编译、执行、调试C++程序。"""
 
 import os
-import resource
 import subprocess
 import time
 from pathlib import Path
@@ -10,20 +9,27 @@ from typing import Any, Dict, Optional
 import psutil
 import yaml
 
-from security import SecurityManager
+# 在 Windows 下没有 resource 模块，尽量兼容运行环境
+try:
+    import resource  # type: ignore
+except (ImportError, ModuleNotFoundError):
+    resource = None  # type: ignore
 
+from security import SecurityManager  # 修复1：添加导入
 
 class CodeRunner:
     """处理C++代码的编译、运行、调试和输出比较。"""
 
     def __init__(self, config_path: str = "config.yaml") -> None:
         """初始化运行器，加载配置和安全管理器。"""
+        # 确保 config_path 不为 None
         if config_path is None:
             config_path = "config.yaml"
 
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
 
+        # config_path 现在一定是 str
         self.security = SecurityManager(config_path)
 
     def compile_cpp(self, code: str, filename: Optional[str] = None) -> Dict[str, Any]:
@@ -36,8 +42,9 @@ class CodeRunner:
             safe_name = self.security.sanitize_filename(filename)
             cpp_file = self.security.temp_dir / "sources" / f"{safe_name}.cpp"
             exe_file = self.security.temp_dir / "execute" / f"{safe_name}.exe"
-
         cpp_file.parent.mkdir(parents=True, exist_ok=True)
+        # 确保可执行文件父目录存在
+        exe_file.parent.mkdir(parents=True, exist_ok=True)
         cpp_file.write_text(code, encoding='utf-8')
 
         compiler = self.config['compilation']['compiler_path']
@@ -60,9 +67,9 @@ class CodeRunner:
                 compile_cmd,
                 capture_output=True,
                 text=True,
+                check=False,
                 timeout=30,
-                cwd=cpp_file.parent,
-                check=False
+                cwd=cpp_file.parent
             )
             return {
                 'success': result.returncode == 0,
@@ -77,10 +84,10 @@ class CodeRunner:
                 'error': '编译超时（30秒）',
                 'executable': None
             }
-        except (OSError, ValueError) as e:
+        except (OSError, subprocess.SubprocessError) as exc:  # 更具体的异常捕获
             return {
                 'success': False,
-                'error': f'编译异常: {str(e)}',
+                'error': f'编译异常: {str(exc)}',
                 'executable': None
             }
 
@@ -91,8 +98,10 @@ class CodeRunner:
             return process.memory_info().rss // 1024
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             return 0
+        except OSError:
+            return 0
 
-    def run_with_input(
+    def run_with_input(  # pylint: disable=subprocess-popen-preexec-fn
         self,
         executable: str,
         input_data: str,
@@ -103,44 +112,55 @@ class CodeRunner:
         if not self.security.validate_command(executable):
             return {'success': False, 'error': '不安全的可执行文件路径'}
 
-        actual_time_limit = (
-            time_limit if time_limit is not None
-            else self.config['execution']['max_time']
-        )
-        actual_memory_limit = (
-            memory_limit if memory_limit is not None
-            else self.config['execution']['max_memory']
-        )
+        # 处理可选参数：如果为 None，则使用配置默认值
+        if time_limit is not None:
+            actual_time_limit = time_limit
+        else:
+            actual_time_limit = self.config['execution']['max_time']
+
+        if memory_limit is not None:
+            actual_memory_limit = memory_limit
+        else:
+            actual_memory_limit = self.config['execution']['max_memory']
 
         input_file = self.security.get_secure_temp_path("inputs").with_suffix('.in')
         input_file.write_text(input_data, encoding='utf-8')
         output_file = input_file.with_suffix('.out')
 
+        # 资源限制函数（仅 Unix）
         def set_limits() -> None:
-            """设置资源限制（仅 Unix）。"""
-            if os.name != 'nt':
-                cpu_seconds = actual_time_limit // 1000 + 1
-                resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
-                memory_bytes = actual_memory_limit * 1024 * 1024
-                resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+            # 仅在类 Unix 平台并且 resource 模块可用时设置限制
+            if os.name != 'nt' and resource is not None:
+                try:
+                    cpu_seconds = int(actual_time_limit // 1000 + 1)
+                    resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
+                    memory_bytes = int(actual_memory_limit * 1024 * 1024)
+                    resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+                except OSError:
+                    # 任何设置限制失败都不要让运行崩溃
+                    pass
 
         start_time = time.time()
-        process = None
         try:
-            with (
-                open(input_file, 'r', encoding='utf-8') as infile,
-                open(output_file, 'w', encoding='utf-8') as outfile
-            ):
-                process = subprocess.Popen(
-                    [executable],
-                    stdin=infile,
-                    stdout=outfile,
-                    stderr=subprocess.PIPE,
-                    preexec_fn=set_limits if os.name != 'nt' else None,
-                    text=True,
-                    cwd=self.security.temp_dir / "execute"
-                )
+            # 确保输入/输出目录存在
+            input_file.parent.mkdir(parents=True, exist_ok=True)
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(input_file, 'r', encoding='utf-8') as infile:
+                with open(output_file, 'w', encoding='utf-8') as outfile:
+                    process = subprocess.Popen(
+                        [executable],
+                        stdin=infile,
+                        stdout=outfile,
+                        stderr=subprocess.PIPE,
+                        preexec_fn=(
+                            set_limits if os.name != 'nt' else None
+                        ),  # pylint: disable=subprocess-popen-preexec-fn
+                        text=True,
+                        cwd=self.security.temp_dir / "execute",
+                    )
                 try:
+                    # 使用 actual_time_limit（毫秒）计算超时秒数
                     timeout_seconds = actual_time_limit / 1000 + 1
                     _, stderr = process.communicate(timeout=timeout_seconds)
                 except subprocess.TimeoutExpired:
@@ -160,29 +180,27 @@ class CodeRunner:
 
             max_output = self.config['execution']['max_output_size']
             if len(output_content.encode('utf-8')) > max_output:
-                output_content = (
-                    output_content[:max_output // 4] +
-                    "\n... (输出被截断)"
-                )
+                output_content = output_content[:max_output//4] + "\n... (输出被截断)"
+
+            memory_used = 0
+            if getattr(process, 'pid', None):
+                memory_used = self._get_memory_usage(process.pid)
 
             return {
                 'success': exit_code == 0,
                 'output': output_content,
                 'error': stderr,
                 'time_used': int(elapsed_time),
-                'memory_used': self._get_memory_usage(process.pid) if process.pid else 0,
-                'exit_code': exit_code
+                'memory_used': memory_used,
+                'exit_code': exit_code,
             }
-        except (OSError, ValueError) as e:
+        except (OSError, subprocess.SubprocessError) as exc:
             return {
                 'success': False,
-                'error': f'运行异常: {str(e)}',
+                'error': f'运行异常: {str(exc)}',
                 'output': None,
                 'time_used': 0
             }
-        finally:
-            if process and process.poll() is None:
-                process.kill()
 
     def compare_outputs(
         self,
@@ -230,27 +248,35 @@ class CodeRunner:
         if script:
             gdb_script.write_text(script, encoding='utf-8')
         else:
-            default_script = """
-            set pagination off
-            break main
-            run
-            backtrace
-            info registers
-            x/10i $pc
-            quit
-            """
+            default_script = "\n".join([
+                "set pagination off",
+                "break main",
+                "run",
+                "backtrace",
+                "info registers",
+                "x/10i $pc",
+                "quit",
+            ])
             gdb_script.write_text(default_script, encoding='utf-8')
 
         try:
-            gdb_path = str(Path(self.config['paths']['mingw_dir']) / "bin" / "gdb.exe")
+            # 修复2：Path 已经在文件顶部导入
+            mingw_dir = None
+            if isinstance(self.config.get('paths'), dict):
+                mingw_dir = self.config['paths'].get('mingw_dir')
+
+            if not mingw_dir:
+                return {'success': False, 'error': '未配置 MinGW 路径 (paths.mingw_dir)', 'output': None}
+
+            gdb_path = str(Path(mingw_dir) / "bin" / "gdb.exe")
             cmd = [gdb_path, '-x', str(gdb_script), executable, '--batch']
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
+                check=False,
                 timeout=30,
-                cwd=self.security.temp_dir / "execute",
-                check=False
+                cwd=self.security.temp_dir / "execute"
             )
             return {
                 'success': result.returncode == 0,
@@ -260,5 +286,5 @@ class CodeRunner:
             }
         except subprocess.TimeoutExpired:
             return {'success': False, 'error': 'GDB调试超时', 'output': None}
-        except (OSError, ValueError) as e:
-            return {'success': False, 'error': f'GDB调试异常: {str(e)}', 'output': None}
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {'success': False, 'error': f'GDB调试异常: {str(exc)}', 'output': None}
