@@ -1,264 +1,727 @@
-"""代码运行模块：编译、执行、调试C++程序。"""
+"""MCP服务器主模块，提供OI助手工具。"""
 
-import os
-import resource
+import asyncio
 import subprocess
+import sys
 import time
+from logging import getLogger
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-import psutil
-import yaml
+# MCP imports
+try:
+    from mcp import types
+    from mcp.server import Server
+    import mcp.server.stdio
+except ImportError as e:
+    print("请安装mcp包: pip install mcp", file=sys.stderr)
+    raise ImportError("MCP包未安装") from e
 
+from runner import CodeRunner
 from security import SecurityManager
 
+logger = getLogger(__name__)
 
-class CodeRunner:
-    """处理C++代码的编译、运行、调试和输出比较。"""
 
-    def __init__(self, config_path: str = "config.yaml") -> None:
-        """初始化运行器，加载配置和安全管理器。"""
-        if config_path is None:
-            config_path = "config.yaml"
+class CommandExecutor:
+    """命令执行器，封装subprocess调用。"""
 
-        with open(config_path, 'r', encoding='utf-8') as f:
-            self.config = yaml.safe_load(f)
+    def __init__(self, security: SecurityManager) -> None:
+        """初始化命令执行器。"""
+        self.security = security
+        self.timeout_default = 30
 
-        self.security = SecurityManager(config_path)
+    def execute(self, cmd: str, timeout: int = 30, cwd: Optional[str] = None,
+                capture_output: bool = True) -> Dict[str, Any]:
+        """执行命令并返回结果。"""
+        if not self.security.validate_command(cmd):
+            return {
+                'success': False,
+                'error': '不安全的命令',
+                'stdout': '',
+                'stderr': '命令被安全策略阻止',
+                'returncode': -1
+            }
 
-    def compile_cpp(self, code: str, filename: Optional[str] = None) -> Dict[str, Any]:
-        """编译C++代码，返回包含成功标志、可执行文件路径和错误信息的字典。"""
-        if filename is None:
-            temp_path = self.security.get_secure_temp_path("compile")
-            cpp_file = temp_path.with_suffix('.cpp')
-            exe_file = temp_path.with_suffix('.exe')
-        else:
-            safe_name = self.security.sanitize_filename(filename)
-            cpp_file = self.security.temp_dir / "sources" / f"{safe_name}.cpp"
-            exe_file = self.security.temp_dir / "execute" / f"{safe_name}.exe"
+        try:
+            result = subprocess.run(
+                cmd.split(),
+                capture_output=capture_output,
+                text=True,
+                timeout=timeout,
+                cwd=cwd,
+                check=False
+            )
+            return {
+                'success': result.returncode == 0,
+                'stdout': result.stdout,
+                'stderr': result.stderr,
+                'returncode': result.returncode
+            }
+        except subprocess.TimeoutExpired as e:
+            return {
+                'success': False,
+                'error': f'执行超时（{timeout}秒）',
+                'stdout': '',
+                'stderr': str(e),
+                'returncode': -1
+            }
+        except (OSError, ValueError) as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'stdout': '',
+                'stderr': f'命令执行失败: {cmd}',
+                'returncode': -1
+            }
 
-        cpp_file.parent.mkdir(parents=True, exist_ok=True)
-        cpp_file.write_text(code, encoding='utf-8')
 
-        compiler = self.config['compilation']['compiler_path']
-        std = self.config['compilation']['cpp_standard']
-        optimization = self.config['compilation']['optimization_level']
+class ToolHandler:
+    """工具处理器基类。"""
 
-        compile_cmd = [
-            compiler,
-            str(cpp_file),
-            '-std=' + std,
-            optimization,
-            '-o', str(exe_file),
-            '-Wall',
-            '-Wextra',
-            '-Werror'
+    def __init__(self, executor: CommandExecutor) -> None:
+        """初始化工具处理器。"""
+        self.executor = executor
+
+    def format_result(self, title: str, cmd: str, result: Dict[str, Any]) -> str:
+        """格式化执行结果。"""
+        lines = [
+            f"## {title}",
+            "```bash",
+            cmd,
+            "```",
+            ""
         ]
 
+        if result['success']:
+            lines.append("✅ 执行成功")
+        else:
+            lines.append("❌ 执行失败")
+
+        if result.get('stdout'):
+            lines.extend(["输出:", "```", result['stdout'], "```"])
+        if result.get('stderr'):
+            lines.extend(["错误信息:", "```", result['stderr'], "```"])
+        if 'returncode' in result:
+            lines.append(f"返回码: {result['returncode']}")
+
+        return "\n".join(lines)
+
+
+class CompileHandler(ToolHandler):
+    """编译相关命令处理器。"""
+
+    async def handle_gpp(self, args: Dict[str, Any]) -> str:
+        """处理g++编译命令。"""
+        source = args.get("source_file", "")
+        output = args.get("output_file", "")
+        flags = args.get("extra_flags", "")
+        cmd = f"g++ {source} -o {output}"
+        if flags:
+            cmd += f" {flags}"
+        result = self.executor.execute(cmd)
+        return self.format_result("g++ 编译命令", cmd, result)
+
+    async def handle_gcc(self, args: Dict[str, Any]) -> str:
+        """处理gcc编译命令。"""
+        source = args.get("source_file", "")
+        output = args.get("output_file", "")
+        flags = args.get("extra_flags", "")
+        cmd = f"gcc {source} -o {output}"
+        if flags:
+            cmd += f" {flags}"
+        result = self.executor.execute(cmd)
+        return self.format_result("gcc 编译命令", cmd, result)
+
+    async def handle_make(self, args: Dict[str, Any]) -> str:
+        """处理make命令。"""
+        target = args.get("target", "all")
+        make_dir = args.get("makefile_dir", ".")
+        extra = args.get("extra_args", "")
+        cmd = f"make -C {make_dir} {target}"
+        if extra:
+            cmd += f" {extra}"
+        result = self.executor.execute(cmd, timeout=60, cwd=make_dir)
+        return self.format_result("make 自动化编译", cmd, result)
+
+
+class DebugHandler(ToolHandler):
+    """调试相关命令处理器。"""
+
+    async def handle_gdb(self, args: Dict[str, Any]) -> str:
+        """处理gdb调试命令。"""
+        executable = args.get("executable", "")
+        commands = args.get("commands", "break main\nrun\nbacktrace\nquit")
+
+        script_file = None
         try:
-            result = subprocess.run(
-                compile_cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=cpp_file.parent,
-                check=False
-            )
-            return {
-                'success': result.returncode == 0,
-                'executable': str(exe_file) if result.returncode == 0 else None,
-                'output': result.stdout,
-                'error': result.stderr,
-                'return_code': result.returncode
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                'success': False,
-                'error': '编译超时（30秒）',
-                'executable': None
-            }
-        except (OSError, ValueError) as e:
-            return {
-                'success': False,
-                'error': f'编译异常: {str(e)}',
-                'executable': None
-            }
+            script_file = self.executor.security.get_secure_temp_path("gdb").with_suffix('.gdb')
+            script_file.write_text(commands, encoding='utf-8')
 
-    def _get_memory_usage(self, pid: int) -> int:
-        """获取进程内存使用量（KB）。"""
-        try:
-            process = psutil.Process(pid)
-            return process.memory_info().rss // 1024
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            return 0
+            cmd = f"gdb -x {script_file} {executable} --batch"
+            result = self.executor.execute(cmd, timeout=60)
 
-    def run_with_input(
-        self,
-        executable: str,
-        input_data: str,
-        time_limit: Optional[int] = None,
-        memory_limit: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """运行可执行文件，提供输入数据，限制时间和内存。"""
-        if not self.security.validate_command(executable):
-            return {'success': False, 'error': '不安全的可执行文件路径'}
+            lines = [
+                "## GDB 调试",
+                f"可执行文件: {executable}",
+                "调试脚本:",
+                "```gdb",
+                commands,
+                "```",
+                ""
+            ]
 
-        actual_time_limit = (
-            time_limit if time_limit is not None
-            else self.config['execution']['max_time']
-        )
-        actual_memory_limit = (
-            memory_limit if memory_limit is not None
-            else self.config['execution']['max_memory']
-        )
+            if result['success']:
+                lines.append("✅ 调试完成")
+            else:
+                lines.append("❌ 调试失败")
 
-        input_file = self.security.get_secure_temp_path("inputs").with_suffix('.in')
-        input_file.write_text(input_data, encoding='utf-8')
-        output_file = input_file.with_suffix('.out')
+            if result.get('stdout'):
+                lines.extend(["调试输出:", "```", result['stdout'], "```"])
+            if result.get('stderr'):
+                lines.extend(["错误信息:", "```", result['stderr'], "```"])
 
-        def set_limits() -> None:
-            """设置资源限制（仅 Unix）。"""
-            if os.name != 'nt':
-                cpu_seconds = actual_time_limit // 1000 + 1
-                resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
-                memory_bytes = actual_memory_limit * 1024 * 1024
-                resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
-
-        start_time = time.time()
-        process = None
-        try:
-            with (
-                open(input_file, 'r', encoding='utf-8') as infile,
-                open(output_file, 'w', encoding='utf-8') as outfile
-            ):
-                process = subprocess.Popen(
-                    [executable],
-                    stdin=infile,
-                    stdout=outfile,
-                    stderr=subprocess.PIPE,
-                    preexec_fn=set_limits if os.name != 'nt' else None,
-                    text=True,
-                    cwd=self.security.temp_dir / "execute"
-                )
-                try:
-                    timeout_seconds = actual_time_limit / 1000 + 1
-                    _, stderr = process.communicate(timeout=timeout_seconds)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    _, stderr = process.communicate()
-                    return {
-                        'success': False,
-                        'error': f'运行超时（{actual_time_limit}ms）',
-                        'time_used': actual_time_limit,
-                        'output': None,
-                        'exit_code': -1
-                    }
-                exit_code = process.returncode
-
-            elapsed_time = (time.time() - start_time) * 1000
-            output_content = output_file.read_text(encoding='utf-8', errors='ignore')
-
-            max_output = self.config['execution']['max_output_size']
-            if len(output_content.encode('utf-8')) > max_output:
-                output_content = (
-                    output_content[:max_output // 4] +
-                    "\n... (输出被截断)"
-                )
-
-            return {
-                'success': exit_code == 0,
-                'output': output_content,
-                'error': stderr,
-                'time_used': int(elapsed_time),
-                'memory_used': self._get_memory_usage(process.pid) if process.pid else 0,
-                'exit_code': exit_code
-            }
-        except (OSError, ValueError) as e:
-            return {
-                'success': False,
-                'error': f'运行异常: {str(e)}',
-                'output': None,
-                'time_used': 0
-            }
+            return "\n".join(lines)
         finally:
-            if process and process.poll() is None:
-                process.kill()
+            if script_file and script_file.exists():
+                script_file.unlink()
 
-    def compare_outputs(
+
+class BinaryHandler(ToolHandler):
+    """二进制工具命令处理器。"""
+
+    async def handle_ld(self, args: Dict[str, Any]) -> str:
+        """处理ld链接命令。"""
+        objects = args.get("object_files", "")
+        output = args.get("output_file", "")
+        lib_paths = args.get("library_paths", "")
+        libs = args.get("libraries", "")
+
+        cmd = f"ld {objects} -o {output}"
+        if lib_paths:
+            cmd += f" {lib_paths}"
+        if libs:
+            cmd += f" {libs}"
+
+        result = self.executor.execute(cmd)
+        return self.format_result("ld 链接器", cmd, result)
+
+    async def handle_as(self, args: Dict[str, Any]) -> str:
+        """处理as汇编命令。"""
+        source = args.get("source_file", "")
+        output = args.get("output_file", "")
+
+        if not output:
+            output = str(Path(source).with_suffix('.o'))
+
+        cmd = f"as {source} -o {output}"
+        result = self.executor.execute(cmd)
+        return self.format_result("as 汇编器", cmd, result)
+
+    async def handle_objdump(self, args: Dict[str, Any]) -> str:
+        """处理objdump命令。"""
+        file_path = args.get("file", "")
+        options = args.get("options", "-d")
+        cmd = f"objdump {options} {file_path}"
+
+        result = self.executor.execute(cmd, timeout=30)
+        lines = [
+            "## objdump 分析",
+            f"文件: {file_path}",
+            f"选项: {options}",
+            "```bash",
+            cmd,
+            "```",
+            ""
+        ]
+
+        if result['success'] and result.get('stdout'):
+            output = result['stdout']
+            if len(output) > 10000:
+                output = output[:10000] + "\n... (输出被截断)"
+            lines.extend(["输出:", "```asm", output, "```"])
+        elif not result['success']:
+            lines.append("❌ 执行失败")
+            if result.get('stderr'):
+                lines.extend(["错误信息:", "```", result['stderr'], "```"])
+
+        return "\n".join(lines)
+
+    async def handle_nm(self, args: Dict[str, Any]) -> str:
+        """处理nm命令。"""
+        file_path = args.get("file", "")
+        options = args.get("options", "-C")
+        cmd = f"nm {options} {file_path}"
+
+        result = self.executor.execute(cmd, timeout=30)
+        lines = [
+            "## nm 符号表",
+            f"文件: {file_path}",
+            f"选项: {options}",
+            "```bash",
+            cmd,
+            "```",
+            ""
+        ]
+
+        if result['success'] and result.get('stdout'):
+            output = result['stdout']
+            if len(output) > 5000:
+                output = output[:5000] + "\n... (输出被截断)"
+            lines.extend(["输出:", "```", output, "```"])
+        elif not result['success']:
+            lines.append("❌ 执行失败")
+            if result.get('stderr'):
+                lines.extend(["错误信息:", "```", result['stderr'], "```"])
+
+        return "\n".join(lines)
+
+
+class OIAssistantServer:
+    """MCP服务器，提供OI助手工具。"""
+
+    def __init__(self) -> None:
+        """初始化服务器、运行器和安全管理器。"""
+        self.runner = CodeRunner()
+        self.security = SecurityManager()
+        self.executor = CommandExecutor(self.security)
+
+        self.compile_handler = CompileHandler(self.executor)
+        self.debug_handler = DebugHandler(self.executor)
+        self.binary_handler = BinaryHandler(self.executor)
+
+        self.server = Server("oi-assistant")
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+        self.setup_handlers()
+
+    def get_server(self) -> Server:
+        """获取MCP服务器实例。"""
+        return self.server
+
+    def get_sessions(self) -> Dict[str, Dict[str, Any]]:
+        """获取会话字典。"""
+        return self.sessions
+
+    def setup_handlers(self) -> None:
+        """注册MCP工具处理器。"""
+
+        @self.server.list_tools()
+        async def handle_list_tools() -> List[types.Tool]:
+            """列出所有可用工具。"""
+            return self._create_tool_list()
+
+        @self.server.call_tool()
+        async def handle_call_tool(name: str, args: Dict[str, Any]) -> List[types.TextContent]:
+            """分发工具调用请求。"""
+            session_id = f"session_{int(time.time())}_{hash(str(args)) % 10000}"
+            self.sessions[session_id] = {
+                "start_time": time.time(),
+                "tool": name
+            }
+
+            try:
+                return await self._route_tool_call(name, args, session_id)
+            except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+                logger.exception("工具执行错误")
+                return [types.TextContent(
+                    type="text",
+                    text=f"执行错误: {str(e)}"
+                )]
+            finally:
+                self.sessions.pop(session_id, None)
+
+    def _create_tool_list(self) -> List[types.Tool]:
+        """创建工具列表。"""
+        return [
+            # 🎯 核心命令
+            types.Tool(
+                name="g++",
+                description="🎯 编译C++代码 - 最常用的编译命令",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "source_file": {
+                            "type": "string",
+                            "description": "源文件路径"
+                        },
+                        "output_file": {
+                            "type": "string",
+                            "description": "输出文件名"
+                        },
+                        "extra_flags": {
+                            "type": "string",
+                            "description": "额外编译选项",
+                            "default": ""
+                        }
+                    },
+                    "required": ["source_file", "output_file"]
+                }
+            ),
+            types.Tool(
+                name="gcc",
+                description="🎯 编译C代码 - 用于C语言编程",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "source_file": {
+                            "type": "string",
+                            "description": "源文件路径"
+                        },
+                        "output_file": {
+                            "type": "string",
+                            "description": "输出文件名"
+                        },
+                        "extra_flags": {
+                            "type": "string",
+                            "description": "额外编译选项",
+                            "default": ""
+                        }
+                    },
+                    "required": ["source_file", "output_file"]
+                }
+            ),
+            # 🔧 辅助命令
+            types.Tool(
+                name="gdb",
+                description="🔧 调试程序 - 单步执行、查看变量、设置断点",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "executable": {
+                            "type": "string",
+                            "description": "要调试的可执行文件"
+                        },
+                        "commands": {
+                            "type": "string",
+                            "description": "GDB命令",
+                            "default": "break main\nrun\nbacktrace\nquit"
+                        }
+                    },
+                    "required": ["executable"]
+                }
+            ),
+            types.Tool(
+                name="make",
+                description="🔧 自动化编译 - 用于多文件项目",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "make目标",
+                            "default": "all"
+                        },
+                        "makefile_dir": {
+                            "type": "string",
+                            "description": "Makefile所在目录",
+                            "default": "."
+                        },
+                        "extra_args": {
+                            "type": "string",
+                            "description": "额外参数",
+                            "default": ""
+                        }
+                    }
+                }
+            ),
+            types.Tool(
+                name="ld",
+                description="🔧 链接器 - 处理链接错误时使用",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "object_files": {
+                            "type": "string",
+                            "description": "目标文件列表"
+                        },
+                        "output_file": {
+                            "type": "string",
+                            "description": "输出文件名"
+                        },
+                        "library_paths": {
+                            "type": "string",
+                            "description": "库路径",
+                            "default": ""
+                        },
+                        "libraries": {
+                            "type": "string",
+                            "description": "链接的库",
+                            "default": ""
+                        }
+                    },
+                    "required": ["object_files", "output_file"]
+                }
+            ),
+            types.Tool(
+                name="as",
+                description="🔧 汇编器 - 将汇编代码转换为机器码",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "source_file": {
+                            "type": "string",
+                            "description": "汇编源文件"
+                        },
+                        "output_file": {
+                            "type": "string",
+                            "description": "输出目标文件",
+                            "default": ""
+                        }
+                    },
+                    "required": ["source_file"]
+                }
+            ),
+            types.Tool(
+                name="objdump",
+                description="🔧 查看二进制信息 - 反汇编、查看段信息",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file": {
+                            "type": "string",
+                            "description": "要分析的文件"
+                        },
+                        "options": {
+                            "type": "string",
+                            "description": "objdump选项",
+                            "default": "-d"
+                        }
+                    },
+                    "required": ["file"]
+                }
+            ),
+            types.Tool(
+                name="nm",
+                description="🔧 列出符号表 - 查看目标文件中的函数和变量",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file": {
+                            "type": "string",
+                            "description": "要分析的文件"
+                        },
+                        "options": {
+                            "type": "string",
+                            "description": "nm选项",
+                            "default": "-C"
+                        }
+                    },
+                    "required": ["file"]
+                }
+            ),
+            types.Tool(
+                name="compile_and_run",
+                description="编译并运行C++代码（集成版）",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "C++源代码"
+                        },
+                        "input": {
+                            "type": "string",
+                            "description": "输入数据"
+                        },
+                        "expected_output": {
+                            "type": "string",
+                            "description": "预期输出"
+                        },
+                        "filename": {
+                            "type": "string",
+                            "description": "文件名"
+                        }
+                    },
+                    "required": ["code", "input"]
+                }
+            ),
+            types.Tool(
+                name="compare_outputs",
+                description="比较两个输出",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "actual": {
+                            "type": "string",
+                            "description": "实际输出"
+                        },
+                        "expected": {
+                            "type": "string",
+                            "description": "预期输出"
+                        },
+                        "ignore_whitespace": {
+                            "type": "boolean",
+                            "default": True
+                        },
+                        "ignore_case": {
+                            "type": "boolean",
+                            "default": False
+                        }
+                    },
+                    "required": ["actual", "expected"]
+                }
+            )
+        ]
+
+    async def _route_tool_call(
         self,
-        actual: str,
-        expected: str,
-        ignore_whitespace: bool = True,
-        ignore_case: bool = False
-    ) -> Dict[str, Any]:
-        """比较实际输出和预期输出，返回差异详情。"""
-        if ignore_whitespace:
-            actual = ' '.join(actual.split())
-            expected = ' '.join(expected.split())
-        if ignore_case:
-            actual = actual.lower()
-            expected = expected.lower()
-
-        actual_lines = actual.strip().split('\n')
-        expected_lines = expected.strip().split('\n')
-        differences = []
-        max_lines = max(len(actual_lines), len(expected_lines))
-
-        for i in range(max_lines):
-            actual_line = actual_lines[i] if i < len(actual_lines) else ""
-            expected_line = expected_lines[i] if i < len(expected_lines) else ""
-            if actual_line != expected_line:
-                differences.append({
-                    'line': i + 1,
-                    'actual': actual_line,
-                    'expected': expected_line
-                })
-
-        return {
-            'match': len(differences) == 0,
-            'differences': differences,
-            'actual_line_count': len(actual_lines),
-            'expected_line_count': len(expected_lines)
+        name: str,
+        args: Dict[str, Any],
+        session_id: str
+    ) -> List[types.TextContent]:
+        """路由工具调用到对应的处理器。"""
+        handlers = {
+            "g++": self.compile_handler.handle_gpp,
+            "gcc": self.compile_handler.handle_gcc,
+            "make": self.compile_handler.handle_make,
+            "gdb": self.debug_handler.handle_gdb,
+            "ld": self.binary_handler.handle_ld,
+            "as": self.binary_handler.handle_as,
+            "objdump": self.binary_handler.handle_objdump,
+            "nm": self.binary_handler.handle_nm,
         }
 
-    def run_gdb(self, executable: str, script: Optional[str] = None) -> Dict[str, Any]:
-        """使用GDB调试程序，返回调试输出。"""
-        if not self.security.validate_command(executable):
-            return {'success': False, 'error': '不安全的可执行文件路径'}
+        if name in handlers:
+            result = await handlers[name](args)
+            return [types.TextContent(type="text", text=result)]
 
-        gdb_script = self.security.get_secure_temp_path("gdb").with_suffix('.gdb')
-        if script:
-            gdb_script.write_text(script, encoding='utf-8')
+        if name == "compile_and_run":
+            return await self._handle_compile_and_run(args, session_id)
+        if name == "compare_outputs":
+            return await self._handle_compare_outputs(args)
+
+        return [types.TextContent(
+            type="text",
+            text=f"未知工具: {name}"
+        )]
+
+    async def _handle_compile_and_run(
+        self,
+        args: Dict[str, Any],
+        session_id: str
+    ) -> List[types.TextContent]:
+        """处理编译运行请求。"""
+        code = args.get("code", "")
+        input_data = args.get("input", "")
+        expected = args.get("expected_output", "")
+        filename = args.get("filename", f"program_{session_id}")
+
+        lines = [
+            "## 编译与运行报告",
+            f"会话ID: {session_id}",
+            f"文件名: {filename}",
+            ""
+        ]
+
+        lines.append("### 1. 编译阶段")
+        compile_result = self.runner.compile_cpp(code, filename)
+        if compile_result['success']:
+            lines.append("✅ 编译成功")
         else:
-            default_script = """
-            set pagination off
-            break main
-            run
-            backtrace
-            info registers
-            x/10i $pc
-            quit
-            """
-            gdb_script.write_text(default_script, encoding='utf-8')
+            lines.append("❌ 编译失败")
+            if compile_result['error']:
+                lines.extend([
+                    "错误信息:",
+                    "```",
+                    compile_result['error'],
+                    "```"
+                ])
+            return [types.TextContent(
+                type="text",
+                text="\n".join(lines)
+            )]
 
-        try:
-            gdb_path = str(Path(self.config['paths']['mingw_dir']) / "bin" / "gdb.exe")
-            cmd = [gdb_path, '-x', str(gdb_script), executable, '--batch']
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=self.security.temp_dir / "execute",
-                check=False
+        lines.append("")
+        lines.append("### 2. 运行阶段")
+        run_result = self.runner.run_with_input(
+            compile_result['executable'],
+            input_data
+        )
+        lines.append(
+            f"运行状态: {'✅ 成功' if run_result['success'] else '❌ 失败'}"
+        )
+        lines.append(f"时间消耗: {run_result['time_used']}ms")
+
+        if run_result['output']:
+            lines.extend([
+                "程序输出:",
+                "```",
+                run_result['output'],
+                "```"
+            ])
+
+        if expected and run_result['output']:
+            lines.append("")
+            lines.append("### 3. 输出比较")
+            compare = self.runner.compare_outputs(
+                run_result['output'],
+                expected
             )
-            return {
-                'success': result.returncode == 0,
-                'output': result.stdout,
-                'error': result.stderr,
-                'return_code': result.returncode
-            }
-        except subprocess.TimeoutExpired:
-            return {'success': False, 'error': 'GDB调试超时', 'output': None}
-        except (OSError, ValueError) as e:
-            return {'success': False, 'error': f'GDB调试异常: {str(e)}', 'output': None}
+            if compare['match']:
+                lines.append("✅ 输出完全匹配！")
+            else:
+                lines.append("❌ 输出不匹配")
+
+        return [types.TextContent(
+            type="text",
+            text="\n".join(lines)
+        )]
+
+    async def _handle_compare_outputs(self, args: Dict[str, Any]) -> List[types.TextContent]:
+        """处理输出比较请求。"""
+        actual = args.get("actual", "")
+        expected = args.get("expected", "")
+        ignore_ws = args.get("ignore_whitespace", True)
+        ignore_case = args.get("ignore_case", False)
+
+        result = self.runner.compare_outputs(
+            actual,
+            expected,
+            ignore_ws,
+            ignore_case
+        )
+        lines = [
+            "## 输出比较结果",
+            ""
+        ]
+
+        if result['match']:
+            lines.append("✅ 输出完全匹配！")
+        else:
+            lines.append("❌ 输出不匹配")
+            if result['differences']:
+                lines.append("")
+                lines.append("差异详情:")
+                for diff in result['differences'][:5]:
+                    lines.append(
+                        f"第{diff['line']}行: "
+                        f"实际='{diff['actual']}', "
+                        f"预期='{diff['expected']}'"
+                    )
+
+        return [types.TextContent(
+            type="text",
+            text="\n".join(lines)
+        )]
+
+    async def run(self) -> None:
+        """启动MCP服务器。"""
+        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+            await self.server.run(
+                read_stream,
+                write_stream,
+                self.server.create_initialization_options()
+            )
+
+
+def main() -> None:
+    """主入口函数。"""
+    server = OIAssistantServer()
+    print("OI助手MCP服务器启动中...", file=sys.stderr)
+    print(f"临时目录: {server.security.temp_dir}", file=sys.stderr)
+    print(f"MinGW目录: {server.security.mingw_dir}", file=sys.stderr)
+    asyncio.run(server.run())
+
+
+if __name__ == "__main__":
+    main()

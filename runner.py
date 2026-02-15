@@ -62,7 +62,7 @@ class CodeRunner:
                 text=True,
                 timeout=30,
                 cwd=cpp_file.parent,
-                check=False  # 明确指定不检查返回码
+                check=False
             )
             return {
                 'success': result.returncode == 0,
@@ -90,8 +90,6 @@ class CodeRunner:
             process = psutil.Process(pid)
             return process.memory_info().rss // 1024
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            return 0
-        except Exception:
             return 0
 
     def run_with_input(
