@@ -42,3 +42,6 @@ Thumbs.db
 
 # Build tools
 mingw64/
+
+# Environment
+.env
